@@ -6,7 +6,7 @@ A compact, cloud-parity streaming pipeline: synthetic payments flow into **Kines
 
 ### Data generation
 
-scripts/generate\_payments.py **simulates** a live card-payments feed, emitting ~1 synthetic event/second to the payments Kinesis stream (via boto3 + LocalStack). Each JSON record includes payment\_id, user\_id (1–50), merchant\_id (1–20), amount ($10–$1000, uniform), and UTC payment\_time; the **PartitionKey is user\_id** to preserve per-user ordering.
+generate\_payments.py **simulates** a live card-payments feed, emitting ~1 synthetic event/second to the payments Kinesis stream (via boto3 + LocalStack). Each JSON record includes payment\_id, user\_id (1–50), merchant\_id (1–20), amount ($10–$1000, uniform), and UTC payment\_time; the **PartitionKey is user\_id** to preserve per-user ordering.
 
 Stack & Highlights
 ------------------
