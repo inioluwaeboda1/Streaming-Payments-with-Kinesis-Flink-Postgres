@@ -50,4 +50,3 @@ docker compose exec postgres psql -U app -d paymentsdb \
   -c "SELECT * FROM anomalies ORDER BY window_end DESC LIMIT 25;"
 
 ```
-  
