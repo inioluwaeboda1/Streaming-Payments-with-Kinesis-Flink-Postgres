@@ -1,0 +1,150 @@
+# Real-Time Payments Pipeline (local dev) — Kinesis → Flink (PyFlink) → Postgres
+# Components: Postgres + pgAdmin, LocalStack (Kinesis), Flink JobManager/TaskManager,
+# and one-shot init jobs to fetch Flink connectors and create the Kinesis stream.
+# Safe startup ordering via healthchecks + depends_on.
+
+services:
+  # ---- OLTP / serving database for downstream analytics ----
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: app # app-scoped DB user (principle of least privilege)
+      POSTGRES_PASSWORD: app # dev-only secret (never use in prod)
+      POSTGRES_DB: paymentsdb # default database name
+    ports:
+      - "5432:5432" # expose Postgres to host for local tooling
+    volumes:
+      - pgdata:/var/lib/postgresql/data # persisted data (named volume)
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro # bootstrap DDL
+    healthcheck:
+      # gate dependents until DB is ready
+      test: [ "CMD-SHELL", "pg_isready -U app -d paymentsdb" ]
+      interval: "5s"
+      timeout: "3s"
+      retries: 20
+    restart: unless-stopped
+
+  # ---- SQL UI for exploration and demos ----
+  pgadmin:
+    image: dpage/pgadmin4:8.13
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: inyx@gmail.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_CHECK_EMAIL_DELIVERABILITY: "False"
+    ports:
+      - "5050:80" # http://localhost:5050
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---- Local AWS emulation (Kinesis) for deterministic dev/testing ----
+  localstack:
+    image: localstack/localstack:3.7
+    container_name: localstack
+    environment:
+      SERVICES: kinesis # only enable what we use to keep it lean
+      DEFAULT_REGION: us-east-1
+      DEBUG: "1" # verbose logs for troubleshooting
+      AWS_ACCESS_KEY_ID: test # dev-only credentials
+      AWS_SECRET_ACCESS_KEY: test
+    ports:
+      - "4566:4566" # LocalStack edge port
+    volumes:
+      - "./.localstack:/var/lib/localstack" # persist emulated state
+      - "/var/run/docker.sock:/var/run/docker.sock" # enables some emulation features
+    healthcheck:
+      # ensure Kinesis API is responsive
+      test: [ "CMD-SHELL", "awslocal kinesis list-streams >/dev/null 2>&1 || exit 1" ]
+      interval: "5s"
+      timeout: "5s"
+      retries: 30
+    restart: unless-stopped
+
+  # ---- One-shot: fetch Flink connector + JDBC driver JARs (version-pinned) ----
+  flink-lib-init:
+    image: curlimages/curl:8.9.1
+    container_name: flink-lib-init
+    entrypoint: [ "/bin/sh", "-lc" ]
+    command: >
+      set -eu; mkdir -p /flink-lib; cd /flink-lib; [ -f flink-sql-connector-aws-kinesis-streams-5.0.0-1.20.jar ] ||
+        curl -L -o flink-sql-connector-aws-kinesis-streams-5.0.0-1.20.jar
+        https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-aws-kinesis-streams/5.0.0-1.20/flink-sql-connector-aws-kinesis-streams-5.0.0-1.20.jar;
+      [ -f flink-connector-jdbc-3.3.0-1.20.jar ] ||
+        curl -L -o flink-connector-jdbc-3.3.0-1.20.jar
+        https://repo1.maven.org/maven2/org/apache/flink/flink-connector-jdbc/3.3.0-1.20/flink-connector-jdbc-3.3.0-1.20.jar;
+      [ -f postgresql-42.7.4.jar ] ||
+        curl -L -o postgresql-42.7.4.jar
+        https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar;
+      ls -lh /flink-lib
+    volumes:
+      - ./flink-lib:/flink-lib # host-mounted so Flink containers auto-pick up JARs
+    restart: "no"
+
+  # ---- One-shot: create the Kinesis stream and wait until it's active ----
+  kinesis-init:
+    image: amazon/aws-cli:latest
+    container_name: kinesis-init
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    entrypoint: [ "/bin/sh", "-lc" ]
+    command: >
+      set -eu; aws --endpoint-url http://localstack:4566 kinesis create-stream --stream-name payments --shard-count 1 || true; aws --endpoint-url http://localstack:4566 kinesis wait stream-exists --stream-name payments
+    depends_on:
+      localstack:
+        condition: service_healthy
+    restart: "no"
+
+  # ---- Flink control plane (with Python support added in Dockerfile.flink) ----
+  jobmanager:
+    image: flink-py:1.20
+    build:
+      context: .
+      dockerfile: Dockerfile.flink # extends Flink 1.20 with Python toolchain
+    container_name: flink-jobmanager
+    ports: [ "8081:8081" ] # Flink Web UI: http://localhost:8081
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+    volumes:
+      - ./flink-lib:/opt/flink/lib # connector + JDBC JARs auto-loaded by Flink
+      - ./flink-app/flink-app.py:/opt/flink/app/flink-app.py:ro # your PyFlink job
+    depends_on:
+      # strict startup ordering for reliability
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      flink-lib-init:
+        condition: service_completed_successfully
+      kinesis-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ---- Flink workers (scale out by adding replicas) ----
+  taskmanager:
+    image: flink-py:1.20
+    container_name: flink-taskmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2   # small but realistic parallelism for dev
+    volumes:
+      - ./flink-lib:/opt/flink/lib
+    depends_on:
+      jobmanager:
+        condition: service_started
+      flink-lib-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata: # named volume for Postgres durability across container restarts
